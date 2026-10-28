@@ -16,6 +16,17 @@ public final class MainActivity extends SDLActivity {
         }
         catch(Exception e) { throw new IllegalStateException("Game asset installation failed", e); }
         super.onCreate(state);
+        if(!gunPermitted())requestPermissions(GUN_PERMISSIONS,0x5746);
+    }
+    // Optional WonderFitter gun; onResume also runs after the permission dialog closes.
+    private static final String[] GUN_PERMISSIONS={"android.permission.BLUETOOTH_SCAN","android.permission.BLUETOOTH_CONNECT"};
+    private boolean gunPermitted() {
+        for(String p:GUN_PERMISSIONS)if(checkSelfPermission(p)!=android.content.pm.PackageManager.PERMISSION_GRANTED)return false;
+        return true;
+    }
+    @Override protected void onResume() {
+        super.onResume();
+        if(gunPermitted())WonderFitterGun.start(this);
     }
     private void installAssets(String category) throws Exception {
         File dir=new File(getFilesDir(),category);

@@ -17,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <time.h>
 #include "ss22_host.h"
@@ -96,6 +97,13 @@ static bool aim_valid,gun_tracked;
 static uint64_t recoil_started;
 static int coin_frames;
 static const ss22_host_game *host;
+/* Optional WonderFitter BLE gun (WonderFitterGun.java). Shots are queued from the
+ * Bluetooth thread; magazine is -1 without a gun, 0 when removed (cover), 1 inserted. */
+static atomic_int wf_shots,wf_magazine=-1;
+#ifndef TCVR_PC
+JNIEXPORT void JNICALL Java_org_timecrisis_quest_WonderFitterGun_nativeShot(JNIEnv *env,jclass cls){(void)env;(void)cls;atomic_fetch_add(&wf_shots,1);}
+JNIEXPORT void JNICALL Java_org_timecrisis_quest_WonderFitterGun_nativeMagazine(JNIEnv *env,jclass cls,jint state){(void)env;(void)cls;atomic_store(&wf_magazine,state);}
+#endif
 static struct Eye { XrSwapchain chain;uint32_t w,h,n;QSwapchainImage *images;GLuint *fb,depth; } eyes[2];
 static double profile_parts[6],profile_thread;
 static double cpu_ms(void){
@@ -231,15 +239,30 @@ static void set_view_distance(int value){
     options_saved=qoptions_save(options_path,&options);
     fprintf(stderr,"[OPTIONS] view distance %d cm; saved %d\n",value,options_saved);
 }
+static void set_gun_offset(int drop,int back){
+    if(drop<QOPTIONS_GUN_DROP_MIN)drop=QOPTIONS_GUN_DROP_MIN;
+    if(drop>QOPTIONS_GUN_DROP_MAX)drop=QOPTIONS_GUN_DROP_MAX;
+    if(back<QOPTIONS_GUN_BACK_MIN)back=QOPTIONS_GUN_BACK_MIN;
+    if(back>QOPTIONS_GUN_BACK_MAX)back=QOPTIONS_GUN_BACK_MAX;
+    if(drop==options.gun_drop&&back==options.gun_back)return;
+    options.gun_drop=drop;options.gun_back=back;options_saved=qoptions_save(options_path,&options);
+    fprintf(stderr,"[OPTIONS] gun offset %d cm down, %d cm back; saved %d\n",drop,back,options_saved);
+}
 static void adjust_horizontal(int direction){
     if(options_page==QOPTIONS_PAGE_GRAPHICS)set_resolution((options.resolution+direction+QRESOLUTION_COUNT)%QRESOLUTION_COUNT);
+    /* Stick right moves the gun forward, i.e. less offset towards the stock. */
+    else if(options_page==QOPTIONS_PAGE_GUN)set_gun_offset(options.gun_drop,options.gun_back-direction);
     else set_world_scale(options.world_scale+direction*QOPTIONS_WORLD_SCALE_STEP);
 }
 static void adjust_vertical(int direction){
-    if(options_page!=QOPTIONS_PAGE_GRAPHICS)set_gun_pitch(options.gun_pitch+direction);
+    /* Stick up raises the gun, i.e. less drop. */
+    if(options_page==QOPTIONS_PAGE_GUN)set_gun_offset(options.gun_drop-direction,options.gun_back);
+    else if(options_page!=QOPTIONS_PAGE_GRAPHICS)set_gun_pitch(options.gun_pitch+direction);
 }
 static void reset_page_setting(void){
-    if(options_page==QOPTIONS_PAGE_GRAPHICS)set_resolution(0);else set_gun_pitch(0);
+    if(options_page==QOPTIONS_PAGE_GRAPHICS)set_resolution(0);
+    else if(options_page==QOPTIONS_PAGE_GUN)set_gun_offset(0,0);
+    else set_gun_pitch(0);
 }
 static bool action(XrAction *out,const char *name,const char *label,XrActionType type,bool both_hands){
     XrActionCreateInfo ci={XR_TYPE_ACTION_CREATE_INFO};ci.actionType=type;
@@ -349,7 +372,7 @@ static void adjust_view_distance(XrTime time){
     if(fabsf(y)>=.65f&&fabsf(x)<.25f&&page_armed){
         change_options_page(y>0?1:-1);return;
     }
-    if(options_page==QOPTIONS_PAGE_GRAPHICS)return;
+    if(options_page!=QOPTIONS_PAGE_MAIN)return;
     if(fabsf(x)<.25f){distance_armed=true;distance_direction=0;distance_repeat_time=0;return;}
     if(!distance_armed||fabsf(x)<.65f||fabsf(x)<fabsf(stick.currentState.y))return;
     int direction=x>0?1:-1;
@@ -454,6 +477,9 @@ static void sync_input(XrTime time,bool head_tracked,float head_y){
     /* Cover must work even when the weapon controller is out of view. */
     bool exposed=qcover_pedal(&cover,head_y,head_tracked);
     if(!paused)pedal=options.physical_crouch?(!cover_calibration_pending&&exposed?1.f:0.f):fmaxf(axis(grip_action,hand_paths[LEFT_HAND]),axis(grip_action,hand_paths[RIGHT_HAND]));
+    /* A connected gun's magazine replaces the grip pedal; physical ducking still applies. */
+    int magazine=atomic_load(&wf_magazine);
+    if(!paused&&magazine>=0)pedal=options.physical_crouch?(magazine?pedal:0.f):(float)magazine;
     XrSpaceLocation locations[HAND_COUNT];bool tracked[HAND_COUNT]={false,false},edges[HAND_COUNT]={false,false},available[HAND_COUNT];
     XrActionStateFloat fire[HAND_COUNT];
     XrSpaceLocationFlags required=XR_SPACE_LOCATION_POSITION_VALID_BIT|XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
@@ -486,11 +512,18 @@ static void sync_input(XrTime time,bool head_tracked,float head_y){
          * Positive raises the barrel; zero preserves the runtime's aim pose. */
         float half_pitch=options.gun_pitch*(3.14159265358979323846f/360.f);
         gun_rotation=product(gun_rotation,(Q4){sinf(half_pitch),0,0,cosf(half_pitch)});
+        /* Move the gun down and back along its own angled axes (-Z is forward). */
+        gun_position=add(gun_position,rotate(gun_rotation,v3(0,-options.gun_drop/100.f,options.gun_back/100.f)));
         gun_origin=qgun_muzzle(gun_position,gun_rotation);
         V3 dir=rotate(gun_rotation,v3(0,0,-1));
         aim_valid=qvr_aim(gun_origin,dir,&nx,&ny,&gun_hit);
         if(!aim_valid)gun_hit=add(gun_origin,mul(dir,2.5f));
         if(!paused&&fire_triggers[hand].pressed)trigger=1;
+        /* Each gun shot is one arcade press on the weapon hand, queued like a short tap. */
+        if(paused)atomic_store(&wf_shots,0);
+        else if(!shot_pending&&atomic_load(&wf_shots)>0){
+            atomic_fetch_sub(&wf_shots,1);shot_pending=true;shot_needs_release=fire_output_down;trigger=1;
+        }
     }else shot_pending=shot_needs_release=false;
 }
 
@@ -502,7 +535,7 @@ bool ss22_host_open(const ss22_host_game *g,int scale,bool full){
     qvr_view_distance=options.view_distance/100.f;
     fprintf(stderr,"[VR SCALE] %.0f arcade units/metre; world size %d%%; view distance %d cm\n",qvr_units_per_meter,options.world_scale,options.view_distance);
     fprintf(stderr,"[OPTIONS] laser %s; cover %s; default hand %s; trigger handoff enabled (left menu: options)\n",options.laser_enabled?"ON":"OFF",options.physical_crouch?"PHYSICAL":"GRIP",options.left_handed?"LEFT":"RIGHT");
-    fprintf(stderr,"[OPTIONS] gun angle %+d deg\n",options.gun_pitch);
+    fprintf(stderr,"[OPTIONS] gun angle %+d deg; gun offset %d cm down, %d cm back\n",options.gun_pitch,options.gun_drop,options.gun_back);
     if(SDL_Init(SDL_INIT_VIDEO|SDL_INIT_AUDIO|SDL_INIT_EVENTS)!=0)goto fail;
 #ifdef TCVR_PC
     desktop=getenv("TCVR_DESKTOP")!=NULL;qvr_flat_view=desktop&&!getenv("TCVR_SCENE_VIEW");
